@@ -12,18 +12,19 @@ var utils = require('./utils');
 
 
 /*
-console.error = function(){
-};
-*/
+ console.error = function(){
+ };
+ */
 
-Promise.config({
-  // Enable warnings.
-  // warnings: true,
-  // Enable long stack traces.
-  longStackTraces: process.NODE_ENV !== 'production',
-  // Enable cancellation.
-  cancellation: true
-});
+Promise.config(
+  {
+    // Enable warnings.
+    // warnings: true,
+    // Enable long stack traces.
+    longStackTraces: process.NODE_ENV !== 'production',
+    // Enable cancellation.
+    cancellation: true
+  })
 
 describe('Queue', function () {
   var sandbox = sinon.sandbox.create();
@@ -255,6 +256,10 @@ describe('Queue', function () {
       return queue.add({ foo: 'bar' }).then(function (job) {
         expect(job.jobId).to.be.ok();
         expect(job.data.foo).to.be('bar');
+        var client = new redis();
+        return client.hgetall('myQ:q:' + job.jobId).then(function (result) {
+          expect(result).to.not.be.null;
+        });
       }).then(function () {
         return queue.close();
       });
@@ -289,6 +294,52 @@ describe('Queue', function () {
         expect(job.jobId).to.be.ok();
         expect(job.data.foo).to.be('bar');
       }, done);
+    });
+
+    it('should remove job after completed if removeOnComplete', function (done) {
+      queue.process(function (job, jobDone) {
+        expect(job.data.foo).to.be.equal('bar');
+        jobDone();
+      }).catch(done);
+
+      queue.add({ foo: 'bar' }, { removeOnComplete: true }).then(function (job) {
+        expect(job.jobId).to.be.ok();
+        expect(job.data.foo).to.be('bar');
+      }, done);
+
+      queue.on('completed', function (job) {
+        queue.getJob(job.jobId).then(function (job) {
+          expect(job).to.be.equal(null);
+        }).then(function () {
+          queue.getJobCounts().then(function (counts) {
+            expect(counts.completed).to.be.equal(0);
+            done();
+          });
+        });
+      });
+    });
+
+    it('should remove job after failed if removeOnFail', function (done) {
+      queue.process(function (job) {
+        expect(job.data.foo).to.be.equal('bar');
+        throw Error('error')
+      }).catch(done);
+
+      queue.add({ foo: 'bar' }, { removeOnFail: true }).then(function (job) {
+        expect(job.jobId).to.be.ok();
+        expect(job.data.foo).to.be('bar');
+      }, done);
+
+      queue.on('failed', function (job) {
+        queue.getJob(job.jobId).then(function (job) {
+          //   expect(job).to.be.equal(null);
+        }).then(function () {
+          queue.getJobCounts().then(function (counts) {
+            expect(counts.failed).to.be.equal(0);
+            done();
+          });
+        });
+      });
     });
 
     it('process a lifo queue', function (done) {
@@ -376,27 +427,28 @@ describe('Queue', function () {
       });
     });
 
-    it('process a job that returns data in the process handler and the returnvalue gets stored in the database', function (done) {
-      queue.process(function (job, jobDone) {
-        expect(job.data.foo).to.be.equal('bar');
-        jobDone(null, 37);
-      });
+    it('process a job that returns data in the process handler and the returnvalue gets stored in the database',
+       function (done) {
+         queue.process(function (job, jobDone) {
+           expect(job.data.foo).to.be.equal('bar');
+           jobDone(null, 37);
+         });
 
-      queue.add({ foo: 'bar' }).then(function (job) {
-        expect(job.jobId).to.be.ok();
-        expect(job.data.foo).to.be('bar');
-      }).catch(done);
+         queue.add({ foo: 'bar' }).then(function (job) {
+           expect(job.jobId).to.be.ok();
+           expect(job.data.foo).to.be('bar');
+         }).catch(done);
 
-      queue.on('completed', function (job, data) {
-        expect(job).to.be.ok();
-        expect(data).to.be.eql(37);
-        expect(job.returnvalue).to.be.eql(37);
-        queue.client.hget(queue.toKey(job.jobId), 'returnvalue').then(function (retval) {
-          expect(JSON.parse(retval)).to.be.eql(37);
-          done();
-        });
-      });
-    });
+         queue.on('completed', function (job, data) {
+           expect(job).to.be.ok();
+           expect(data).to.be.eql(37);
+           expect(job.returnvalue).to.be.eql(37);
+           queue.client.hget(queue.toKey(job.jobId), 'returnvalue').then(function (retval) {
+             expect(JSON.parse(retval)).to.be.eql(37);
+             done();
+           });
+         });
+       });
 
     it('process a job that returns a promise', function (done) {
       queue.process(function (job) {
@@ -455,7 +507,7 @@ describe('Queue', function () {
     it('process stalled jobs when starting a queue', function (done) {
       this.timeout(12000);
       utils.newQueue('test queue stalled').then(function (queueStalled) {
-        queueStalled.LOCK_RENEW_TIME = 10;
+        queueStalled.LOCK_DURATION = 10;
         var jobs = [
           queueStalled.add({ bar: 'baz' }),
           queueStalled.add({ bar1: 'baz1' }),
@@ -470,7 +522,6 @@ describe('Queue', function () {
             return queueStalled.close(true).then(function () {
               return new Promise(function (resolve, reject) {
                 utils.newQueue('test queue stalled').then(function (queue2) {
-                  queue2.LOCK_RENEW_TIME = 100;
                   var doneAfterFour = _.after(4, function () {
                     try {
                       expect(stalledCallback.calledOnce).to.be(true);
@@ -729,17 +780,17 @@ describe('Queue', function () {
     });
 
     it('does not renew a job lock after the lock has been released [#397]', function (done) {
-      this.timeout(queue.LOCK_RENEW_TIME * 3);
+      this.timeout(queue.LOCK_RENEW_TIME * 4);
 
       queue.process(function (job) {
         expect(job.data.foo).to.be.equal('bar');
         return Promise.resolve();
-      }).then(function() { done(); }, done);
+      }).then(function () { done(); }, done);
 
       var distEmit = queue.distEmit.bind(queue);
-      queue.distEmit = function() {
+      queue.distEmit = function () {
         var args = arguments;
-        return Promise.delay(queue.LOCK_RENEW_TIME * 2).then(function() {
+        return Promise.delay(queue.LOCK_RENEW_TIME * 2).then(function () {
           return distEmit.apply(null, args);
         });
       };
@@ -965,7 +1016,7 @@ describe('Queue', function () {
               return null;
             });
 
-            var paused = queue.getJobCountByTypes(['wait', 'delayed']).then(function (count) {
+            var paused = queue.getJobCountByTypes(['paused', 'wait', 'delayed']).then(function (count) {
               expect(count).to.be(10);
               return null;
             });
@@ -976,6 +1027,82 @@ describe('Queue', function () {
           });
         }).catch(done);
       });
+    });
+  });
+
+
+  it('should pause the queue locally when more than one worker is active', function () {
+    var queue1 = utils.buildQueue('pause-queue');
+    var queue1IsProcessing = new Promise(function (resolve) {
+      queue1.process(function (job, jobDone) {
+        resolve();
+        setTimeout(jobDone, 200);
+      });
+    });
+
+    var queue2 = utils.buildQueue('pause-queue');
+    var queue2IsProcessing = new Promise(function (resolve) {
+      queue2.process(function (job, jobDone) {
+        resolve();
+        setTimeout(jobDone, 200);
+      });
+    });
+
+    queue1.add(1);
+    queue1.add(2);
+    queue1.add(3);
+    queue1.add(4);
+
+    return Promise.all([queue1IsProcessing, queue2IsProcessing]).then(function () {
+      return Promise.all([queue1.pause(true /* local */), queue2.pause(true /* local */)]).then(function () {
+
+        var active = queue1.getJobCountByTypes(['active']).then(function (count) {
+          expect(count).to.be(0);
+        });
+
+        var pending = queue1.getJobCountByTypes(['wait']).then(function (count) {
+          expect(count).to.be(2);
+        });
+
+        var completed = queue1.getJobCountByTypes(['completed']).then(function (count) {
+          expect(count).to.be(2);
+        });
+
+        return Promise.all([active, pending, completed]);
+      });
+    });
+  });
+
+  it('should wait for blocking job retrieval to complete before pausing locally', function () {
+    var queue = utils.buildQueue();
+    queue.process(function (job, jobDone) {
+      setTimeout(jobDone, 200);
+    });
+
+    return new Promise(function (resolve) {
+      queue.on('ready', resolve);
+    }).then(function () {
+      //start the pause process
+      var queueIsPaused = queue.pause(true);
+      //add some jobs
+      return Promise.all([queue.add(1), queue.add(2)]).then(function () {
+        //wait for the queue to finish pausing
+        return queueIsPaused;
+      });
+    }).then(function () {
+      var active = queue.getJobCountByTypes(['active']).then(function (count) {
+        expect(count).to.be(0);
+      });
+
+      var pending = queue.getJobCountByTypes(['wait']).then(function (count) {
+        expect(count).to.be(1);
+      });
+
+      var completed = queue.getJobCountByTypes(['completed']).then(function (count) {
+        expect(count).to.be(1);
+      });
+
+      return Promise.all([active, pending, completed]);
     });
   });
 
@@ -1006,6 +1133,24 @@ describe('Queue', function () {
       });
     });
   });
+
+  it('should listen to global events', function (done) {
+    var queue1 = utils.buildQueue();
+    var queue2 = utils.buildQueue();
+    queue1.process(function (job, jobDone) {
+      jobDone();
+    });
+    queue1.add({});
+    queue2.once('global:waiting', function () {
+      queue2.once('global:active', function () {
+        queue2.once('global:completed', function () {
+          queue1.close().then(function () {
+            queue2.close().then(done);
+          });
+        });
+      });
+    });
+  })
 
   describe('Delayed jobs', function () {
     var queue;
@@ -1120,16 +1265,16 @@ describe('Queue', function () {
           queue.process(fn);
         }).delay(20).then(function () {
           /*
-          //We simulate a restart
-          console.log('RESTART');
-          return queue.close().then(function () {
-            console.log('CLOSED');
-            return Promise.delay(100).then(function () {
-              queue = new Queue(QUEUE_NAME);
-              queue.process(fn);
-            });
-          });
-          */
+           //We simulate a restart
+           console.log('RESTART');
+           return queue.close().then(function () {
+           console.log('CLOSED');
+           return Promise.delay(100).then(function () {
+           queue = new Queue(QUEUE_NAME);
+           queue.process(fn);
+           });
+           });
+           */
         });
     });
 
@@ -1426,14 +1571,16 @@ describe('Queue', function () {
             });
           })
           .then(function () {
-            return Promise.all([
-              queue.getCompletedCount().then(function (count) {
-                return expect(count).to.equal(0);
-              }),
-              queue.getFailedCount().then(function (count) {
-                return expect(count).to.equal(0);
-              })
-            ]);
+            return Promise.all(
+              [
+                queue.getCompletedCount().then(function (count) {
+                  return expect(count).to.equal(0);
+                }),
+                queue.getFailedCount().then(function (count) {
+                  return expect(count).to.equal(0);
+                })
+              ]
+            );
           })
           .then(function () {
             done();
@@ -1475,14 +1622,15 @@ describe('Queue', function () {
             });
           })
           .then(function () {
-            return Promise.all([
-              queue.getCompletedCount().then(function (count) {
-                return expect(count).to.equal(1);
-              }),
-              queue.getFailedCount().then(function (count) {
-                return expect(count).to.equal(0);
-              })
-            ]);
+            return Promise.all(
+              [
+                queue.getCompletedCount().then(function (count) {
+                  return expect(count).to.equal(1);
+                }),
+                queue.getFailedCount().then(function (count) {
+                  return expect(count).to.equal(0);
+                })
+              ]);
           })
           .then(function () {
             done();
